@@ -1243,6 +1243,10 @@ void CardDav::upsyncResponse()
                               Buteo::TargetResults::ITEM_OPERATION_FAILED,
                               QStringLiteral("405 Method Not Allowed - the collection may be read-only"));
         } else {
+            q->recordUpsynced(addressbookUrl, upsyncedUid(reply), upsyncedOperation(reply),
+                              Buteo::TargetResults::ITEM_OPERATION_FAILED,
+                              (httpError ? QStringLiteral("HTTP %1").arg(httpError) : reply->errorString())
+                                  + QStringLiteral(" - sync aborted"));
             errorOccurred(httpError);
             return;
         }
