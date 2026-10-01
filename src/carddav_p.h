@@ -98,10 +98,13 @@ private Q_SLOTS:
     void contactMetadataResponse();
     void contactsResponse();
     void upsyncResponse();
+    void deletionProbeResponse();
+    void modificationProbeResponse();
     void upsyncComplete(const QString &addressbookUrl);
     void errorOccurred(int httpError);
 
 private:
+    bool startProbe(QNetworkReply *refused, const char *slot, bool afterRecreation = false);
     void calculateContactChanges(const QString &addressbookUrl, const QList<QContact> &added, const QList<QContact> &modified);
 
     enum DiscoveryStage {

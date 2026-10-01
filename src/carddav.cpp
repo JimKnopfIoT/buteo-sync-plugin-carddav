@@ -887,6 +887,7 @@ void CardDav::contactMetadataResponse()
             }
         };
         createHash(q->m_collectionAMRU[addressbookUrl].modified);
+        createHash(q->m_collectionAMRU[addressbookUrl].removed);
         createHash(q->m_collectionAMRU[addressbookUrl].unmodified);
     }
 
@@ -1018,11 +1019,44 @@ void CardDav::calculateContactChanges(const QString &addressbookUrl, const QList
     }
 }
 
+// Takes a contact back out of the set of upsynced changes, so that our version
+// of it is not written back into the local database.
+static void removeUpsyncedContact(QList<QContact> *list, const QContactId &id)
+{
+    for (int i = list->size() - 1; i >= 0; --i) {
+        if (list->at(i).id() == id) {
+            list->removeAt(i);
+            return;
+        }
+    }
+}
+
 static void setContactGuid(QContact *c, const QString &uid)
 {
     QContactGuid newGuid = c->detail<QContactGuid>();
     newGuid.setGuid(uid);
     c->saveDetail(&newGuid, QContact::IgnoreAccessConstraints);
+}
+
+static QString replyEtag(QNetworkReply *reply)
+{
+    return QString::fromUtf8(reply->rawHeader("ETag"));
+}
+
+// Fetches the contact a refused upsync request was for; slot carries on.
+bool CardDav::startProbe(QNetworkReply *refused, const char *slot, bool afterRecreation)
+{
+    QNetworkReply *probe = m_request->contactGet(m_serverUrl, refused->property("contactUri").toString());
+    if (!probe) {
+        return false;
+    }
+    for (const char *name : { "addressbookUrl", "contactUri", "contactGuid", "contactId", "vcard", "etag" }) {
+        probe->setProperty(name, refused->property(name));
+    }
+    probe->setProperty("afterRecreation", afterRecreation);
+    connect(probe, SIGNAL(sslErrors(QList<QSslError>)), this, SLOT(sslErrorsOccurred(QList<QSslError>)));
+    connect(probe, SIGNAL(finished()), this, slot);
+    return true;
 }
 
 bool CardDav::upsyncUpdates(const QString &addressbookUrl, const QList<QContact> &added, const QList<QContact> &modified, const QList<QContact> &removed)
@@ -1124,8 +1158,22 @@ bool CardDav::upsyncUpdates(const QString &addressbookUrl, const QList<QContact>
         const QString uri = c.detail<QContactSyncTarget>().syncTarget();
         const QString vcard = m_converter->convertContactToVCard(c, unsupportedProperties);
 
+        // Modified here, removed remotely: the etag we hold is stale and a
+        // conditional PUT could only be refused.  A modification beats a
+        // deletion - the same way round as when a local deletion loses against
+        // a remote change - so put the contact back, unless someone else has
+        // already, and keep the local row instead of applying the removal to it.
+        const bool removedRemotely = q->m_remoteRemovals[addressbookUrl].contains(uri);
+        if (removedRemotely) {
+            qCWarning(lcCardDav) << Q_FUNC_INFO << "local modification of" << uri
+                       << "conflicts with a remote removal - recreating the contact";
+            q->m_keepIds[addressbookUrl].insert(c.id());
+        }
+
         // upload
-        QNetworkReply *reply = m_request->upsyncAddMod(m_serverUrl, uri, etag, vcard);
+        QNetworkReply *reply = removedRemotely
+                ? m_request->upsyncRecreate(m_serverUrl, uri, vcard)
+                : m_request->upsyncAddMod(m_serverUrl, uri, etag, vcard);
         if (!reply) {
             return false;
         }
@@ -1137,6 +1185,11 @@ bool CardDav::upsyncUpdates(const QString &addressbookUrl, const QList<QContact>
         hadNonSpuriousChanges = true;
         reply->setProperty("addressbookUrl", addressbookUrl);
         reply->setProperty("contactGuid", guidstr);
+        reply->setProperty("contactUri", uri);
+        reply->setProperty("contactId", QVariant::fromValue(c.id()));
+        reply->setProperty("vcard", vcard);
+        reply->setProperty("isModification", !removedRemotely);
+        reply->setProperty("isRecreation", removedRemotely);
         connect(reply, SIGNAL(sslErrors(QList<QSslError>)), this, SLOT(sslErrorsOccurred(QList<QSslError>)));
         connect(reply, SIGNAL(finished()), this, SLOT(upsyncResponse()));
     }
@@ -1150,6 +1203,16 @@ bool CardDav::upsyncUpdates(const QString &addressbookUrl, const QList<QContact>
             qCWarning(lcCardDav) << Q_FUNC_INFO << "deleted contact server uri unknown:" << QString::fromLatin1(c.id().localId()) << " - " << guidstr;
             continue; // TODO: this is actually an error.
         }
+
+        // Deleted here, modified remotely: remote wins.  Our etag is stale,
+        // so the DELETE could not succeed anyway.
+        if (q->m_remoteModifications[addressbookUrl].contains(uri)) {
+            qCWarning(lcCardDav) << Q_FUNC_INFO << "local deletion of" << uri
+                       << "conflicts with a remote modification - keeping the remote version";
+            q->m_undeleteIds[addressbookUrl].insert(c.id());
+            continue;
+        }
+
         QString etag;
         for (const QContactExtendedDetail &ed : c.details<QContactExtendedDetail>()) {
             if (ed.name() == KEY_ETAG) {
@@ -1165,6 +1228,10 @@ bool CardDav::upsyncUpdates(const QString &addressbookUrl, const QList<QContact>
         m_upsyncRequests[addressbookUrl] += 1;
         hadNonSpuriousChanges = true;
         reply->setProperty("addressbookUrl", addressbookUrl);
+        reply->setProperty("isDeletion", true);
+        reply->setProperty("contactUri", uri);
+        reply->setProperty("etag", etag);
+        reply->setProperty("contactId", QVariant::fromValue(c.id()));
         connect(reply, SIGNAL(sslErrors(QList<QSslError>)), this, SLOT(sslErrorsOccurred(QList<QSslError>)));
         connect(reply, SIGNAL(finished()), this, SLOT(upsyncResponse()));
     }
@@ -1198,12 +1265,49 @@ void CardDav::upsyncResponse()
         qCWarning(lcCardDav) << Q_FUNC_INFO << "error:" << reply->error()
                    << "(" << httpError << ")";
         debugDumpData(QString::fromUtf8(data));
-        if (httpError == 405) {
-            // MethodNotAllowed error.  Most likely the server has restricted
-            // new writes to the collection (e.g., read-only or update-only).
-            // We should not abort the sync if we receive this error.
-            qCWarning(lcCardDav) << Q_FUNC_INFO << "405 MethodNotAllowed - is the collection read-only?";
-            qCWarning(lcCardDav) << Q_FUNC_INFO << "continuing sync despite this error - upsync will have failed!";
+        const bool isDeletion = reply->property("isDeletion").toBool();
+        const bool isRecreation = reply->property("isRecreation").toBool();
+        // 409 no-uid-conflict (400 before Nextcloud 32): the contact lives on
+        // under another uri, which this sync downloads as an addition.
+        const bool uidTaken = isRecreation && (httpError == 409 || httpError == 400);
+        if (httpError == 405 || uidTaken) {
+            if (uidTaken) {
+                qCWarning(lcCardDav) << Q_FUNC_INFO << reply->property("contactUri").toString()
+                           << "cannot be recreated: its uid exists elsewhere - dropping the local modification";
+            } else {
+                // MethodNotAllowed error.  Most likely the server has restricted
+                // new writes to the collection (e.g., read-only or update-only).
+                // We should not abort the sync if we receive this error.
+                qCWarning(lcCardDav) << Q_FUNC_INFO << "405 MethodNotAllowed - is the collection read-only?";
+                qCWarning(lcCardDav) << Q_FUNC_INFO << "continuing sync despite this error - upsync will have failed!";
+            }
+            if (isRecreation) {
+                // Cannot be put back: let the remote removal through.
+                const QContactId contactId = reply->property("contactId").value<QContactId>();
+                q->m_keepIds[addressbookUrl].remove(contactId);
+                removeUpsyncedContact(&m_upsyncedChanges[addressbookUrl].modifications, contactId);
+            }
+        } else if (isDeletion && (httpError == 404 || httpError == 410)) {
+            // Already gone - the outcome we wanted.
+            qCWarning(lcCardDav) << Q_FUNC_INFO << "contact already removed server-side (" << httpError
+                       << ") - treating deletion as successful";
+        } else if (httpError == 412
+                   && (isDeletion || reply->property("isModification").toBool() || isRecreation)) {
+            // Changed or gone: a missing resource fails If-Match on PUT, and
+            // SabreDAV answers a conditional DELETE of one with 412 as well.
+            // After If-None-Match: taken again.  Fetch what is there now.
+            const bool ok = isDeletion
+                    ? startProbe(reply, SLOT(deletionProbeResponse()))
+                    : startProbe(reply, SLOT(modificationProbeResponse()), isRecreation);
+            if (ok) {
+                qCWarning(lcCardDav) << Q_FUNC_INFO << reply->property("contactUri").toString()
+                           << "refused with 412 - checking what is there now";
+                return; // The probe's handler carries on.
+            }
+            // Cannot ask.  Failing keeps the local change pending: a sync that
+            // ends successfully clears the change flags of the collection.
+            errorOccurred(httpError);
+            return;
         } else {
             errorOccurred(httpError);
             return;
@@ -1213,14 +1317,7 @@ void CardDav::upsyncResponse()
     if (!guid.isEmpty()) {
         // this is an addition or modification.
         // get the new etag value reported by the server.
-        QString etag;
-        Q_FOREACH(const QByteArray &header, reply->rawHeaderList()) {
-            if (QString::fromUtf8(header).contains(QLatin1String("etag"), Qt::CaseInsensitive)) {
-                etag = reply->rawHeader(header);
-                break;
-            }
-        }
-
+        const QString etag = replyEtag(reply);
         if (!etag.isEmpty()) {
             qCDebug(lcCardDav) << "Got updated etag for" << guid << ":" << etag;
             // store the updated etag into the upsynced contact
@@ -1252,6 +1349,91 @@ void CardDav::upsyncResponse()
     }
 
     upsyncComplete(addressbookUrl);
+}
+
+void CardDav::deletionProbeResponse()
+{
+    QNetworkReply *reply = qobject_cast<QNetworkReply*>(sender());
+    reply->deleteLater();
+    const QString addressbookUrl = reply->property("addressbookUrl").toString();
+    const QString uri = reply->property("contactUri").toString();
+    const QContactId contactId = reply->property("contactId").value<QContactId>();
+    const QByteArray data = reply->readAll();
+    const int httpError = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+    if (httpError == 404 || httpError == 410) {
+        qCWarning(lcCardDav) << Q_FUNC_INFO << "contact" << uri
+                   << "is gone server-side - treating deletion as successful";
+        upsyncComplete(addressbookUrl);
+        return;
+    }
+
+    if (reply->error() != QNetworkReply::NoError || httpError != 200) {
+        qCWarning(lcCardDav) << Q_FUNC_INFO << "could not check" << uri << "(" << httpError
+                   << ") - aborting, the deletion stays pending";
+        errorOccurred(httpError);
+        return;
+    }
+
+    const QString etag = replyEtag(reply);
+    if (etag.isEmpty() || etag == reply->property("etag").toString()) {
+        // Present, but not shown to have changed: the 412 is unexplained.
+        qCWarning(lcCardDav) << Q_FUNC_INFO << "deletion of" << uri
+                   << "refused although unchanged - aborting, the deletion stays pending";
+        errorOccurred(412);
+        return;
+    }
+
+    // Changed elsewhere: the modification wins.
+    q->m_undeleteIds[addressbookUrl].insert(contactId);
+    bool ok = true;
+    QContact fetched = m_parser->buildContact(QString::fromUtf8(data), addressbookUrl, uri, etag, &ok);
+    if (ok) {
+        // Into the remote change set; written once the row is undeleted.
+        fetched.setId(contactId);
+        m_upsyncedChanges[addressbookUrl].modifications.append(fetched);
+        qCWarning(lcCardDav) << Q_FUNC_INFO << "keeping the server version of" << uri;
+    } else {
+        qCWarning(lcCardDav) << Q_FUNC_INFO << "could not parse the server version of" << uri
+                   << "- reviving the local contact unchanged";
+    }
+    upsyncComplete(addressbookUrl);
+}
+
+void CardDav::modificationProbeResponse()
+{
+    QNetworkReply *reply = qobject_cast<QNetworkReply*>(sender());
+    reply->deleteLater();
+    const QString addressbookUrl = reply->property("addressbookUrl").toString();
+    const QString uri = reply->property("contactUri").toString();
+    const QContactId contactId = reply->property("contactId").value<QContactId>();
+    const int httpError = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
+    if ((httpError == 404 || httpError == 410) && !reply->property("afterRecreation").toBool()) {
+        // Removed elsewhere while it was being changed here.  A modification
+        // beats a deletion, so put the contact back and keep the local row.
+        // If-None-Match keeps us from overwriting a concurrent recreation.
+        QNetworkReply *recreate = m_request->upsyncRecreate(m_serverUrl, uri, reply->property("vcard").toString());
+        if (recreate) {
+            qCWarning(lcCardDav) << Q_FUNC_INFO << "contact" << uri
+                       << "is gone server-side - recreating it from the local version";
+            q->m_keepIds[addressbookUrl].insert(contactId);
+            for (const char *name : { "addressbookUrl", "contactUri", "contactGuid", "contactId", "vcard" }) {
+                recreate->setProperty(name, reply->property(name));
+            }
+            recreate->setProperty("isRecreation", true);
+            connect(recreate, SIGNAL(sslErrors(QList<QSslError>)), this, SLOT(sslErrorsOccurred(QList<QSslError>)));
+            connect(recreate, SIGNAL(finished()), this, SLOT(upsyncResponse()));
+            return;
+        }
+    }
+
+    // Changed (or recreated) elsewhere, or no answer.  Fail: a sync that ends
+    // successfully clears the change flags and would drop the modification.
+    // The next sync sees the remote change and merges it in the adaptor.
+    qCWarning(lcCardDav) << Q_FUNC_INFO << "conflict on" << uri << "(" << httpError
+               << ") - aborting, the next sync merges it";
+    errorOccurred(httpError == 200 ? 412 : httpError);
 }
 
 void CardDav::upsyncComplete(const QString &addressbookUrl)
